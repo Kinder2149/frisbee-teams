@@ -2,13 +2,59 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import io
+import re
 
-# Fonctions de validation (identiques au fichier précédent)
+# Définir les alias pour les colonnes avec plus de flexibilité
 COLUMN_ALIASES = {
-    'nom': ['nom', 'name', 'joueur', 'player', 'prenom', 'firstname'],
-    'technique': ['technique', 'skill', 'competence', 'capacite', 'tech'],
-    'physique': ['physique', 'physical', 'condition', 'fitness', 'phys']
+    'nom': [
+        'nom', 'name', 'joueur', 'player', 'prenom', 'firstname', 
+        'nom et prénom', 'participant', 'prénom', 'identifiant'
+    ],
+    'technique': [
+        'technique', 'skill', 'competence', 'capacite', 'tech', 
+        'niveau technique', 'niveau', 'note technique', 
+        'note ton niveau technique', 'compétence'
+    ],
+    'physique': [
+        'physique', 'physical', 'condition', 'fitness', 'phys', 
+        'niveau physique', 'forme', 'endurance', 
+        'note physique', 'note ton niveau physique'
+    ]
 }
+
+def clean_column_name(column):
+    """
+    Nettoyer et normaliser les noms de colonnes
+    """
+    return (column.lower()
+        .replace(' ', '')
+        .replace('é', 'e')
+        .replace('è', 'e')
+        .replace('ê', 'e')
+    )
+
+def extract_numeric_value(value):
+    """
+    Extraire une valeur numérique d'une chaîne
+    Gère les formats comme "4/5", "4 / 5", etc.
+    """
+    if pd.isna(value):
+        return None
+    
+    # Convertir en chaîne si ce n'est pas déjà le cas
+    str_value = str(value).lower().replace(',', '.')
+    
+    # Chercher un nombre (entier ou decimal)
+    match = re.search(r'(\d+(?:\.\d+)?)', str_value)
+    
+    if match:
+        try:
+            num = float(match.group(1))
+            return num if 1 <= num <= 5 else None
+        except (ValueError, TypeError):
+            return None
+    
+    return None
 
 def fuzzy_column_match(data_columns):
     """
@@ -17,19 +63,25 @@ def fuzzy_column_match(data_columns):
     column_mapping = {}
     unmatched_columns = []
 
+    # Normaliser les noms de colonnes existants
+    normalized_data_columns = [clean_column_name(col) for col in data_columns]
+    
     for req_col, aliases in COLUMN_ALIASES.items():
-        # Normaliser les noms de colonnes existants
-        normalized_data_columns = [col.lower().replace(' ', '') for col in data_columns]
-        
         # Rechercher une correspondance
         matched = False
         for alias in aliases:
-            normalized_alias = alias.lower().replace(' ', '')
-            if normalized_alias in normalized_data_columns:
-                # Trouver l'index de la colonne correspondante
-                orig_col = data_columns[normalized_data_columns.index(normalized_alias)]
-                column_mapping[req_col] = orig_col
-                matched = True
+            normalized_alias = clean_column_name(alias)
+            
+            # Recherche inclusive
+            for idx, norm_col in enumerate(normalized_data_columns):
+                if (normalized_alias in norm_col or 
+                    norm_col in normalized_alias):
+                    orig_col = data_columns[idx]
+                    column_mapping[req_col] = orig_col
+                    matched = True
+                    break
+            
+            if matched:
                 break
         
         if not matched:
@@ -37,113 +89,71 @@ def fuzzy_column_match(data_columns):
     
     return column_mapping, unmatched_columns
 
-def load_and_preview_data(uploaded_file):
+def load_data(file_path):
+    """
+    Charger des fichiers avec support élargi
+    """
     try:
-        # Lire le fichier (support Excel et CSV)
-        if uploaded_file.name.endswith(('.xls', '.xlsx')):
-            data = pd.read_excel(uploaded_file)
+        # Support élargi des fichiers
+        if file_path.endswith(('.xls', '.xlsx')):
+            try:
+                # Premier essai : lecture standard
+                data = pd.read_excel(file_path)
+            except Exception:
+                # Deuxième essai avec openpyxl
+                data = pd.read_excel(
+                    file_path, 
+                    engine='openpyxl', 
+                    dtype=str  # Lire tous les types comme des chaînes
+                )
+        elif file_path.endswith('.csv'):
+            # Support des CSV avec différents encodages
+            encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+            for encoding in encodings:
+                try:
+                    data = pd.read_csv(file_path, encoding=encoding)
+                    break
+                except Exception:
+                    continue
+            else:
+                raise ValueError("Impossible de lire le fichier CSV")
         else:
-            data = pd.read_csv(uploaded_file)
+            raise ValueError("Format de fichier non supporté")
+
+        # Nettoyer les noms de colonnes
+        data.columns = data.columns.str.strip()
         
-        st.info("Fichier chargé avec succès ! Voici un aperçu des premières lignes :")
-        st.dataframe(data.head())  # Afficher les 5 premières lignes pour prévisualisation
         return data
     except Exception as e:
-        st.error(f"Erreur lors du chargement du fichier : {e}")
-        return None
+        raise ValueError(f"Erreur lors du chargement du fichier : {e}")
 
-def validate_columns(data):
-    st.write("**Étape 1 : Identification des colonnes**")
-    
-    # Recherche de correspondance floue
-    column_mapping, unmatched_columns = fuzzy_column_match(data.columns)
-    
-    # Si des colonnes sont manquantes, interaction utilisateur
-    if unmatched_columns:
-        st.warning(f"Les colonnes suivantes n'ont pas été identifiées automatiquement : {', '.join(unmatched_columns)}")
-        
-        for missing_col in unmatched_columns:
-            # Proposer des options de colonnes existantes
-            selected_col = st.selectbox(
-                f"Sélectionnez la colonne correspondant à '{missing_col}'", 
-                options=list(data.columns),
-                key=f"column_select_{missing_col}"
-            )
-            column_mapping[missing_col] = selected_col
-    
-    # Renommer les colonnes
-    data_renamed = data.rename(columns=column_mapping)
-    
-    # Vérifier que toutes les colonnes requises sont présentes
-    final_columns = ['nom', 'technique', 'physique']
-    for col in final_columns:
-        if col not in data_renamed.columns:
-            st.error(f"La colonne '{col}' est manquante.")
-            return False, None, None
-    
-    st.success("Toutes les colonnes nécessaires sont identifiées !")
-    return True, data_renamed, column_mapping
+def validate_data(players):
+    """
+    Valider et nettoyer les données des joueurs
+    """
+    # Vérifier les colonnes requises
+    required_columns = ['nom', 'technique', 'physique']
+    if not all(col in players.columns for col in required_columns):
+        raise ValueError(f"Le fichier doit contenir les colonnes : {', '.join(required_columns)}")
 
-def validate_and_clean_data(data):
-    st.write("**Étape 2 : Validation et nettoyage des données**")
-    
-    # Convertir les colonnes en numérique, forcer les erreurs à NaN
+    # Supprimer les lignes vides
+    players = players.dropna()
+
+    # Convertir les colonnes de score
     for col in ['technique', 'physique']:
-        data[col] = pd.to_numeric(data[col], errors='coerce')
+        players[col] = players[col].apply(extract_numeric_value)
 
-    # Vérifier les valeurs manquantes ou non valides
-    invalid_rows = data[data[['technique', 'physique']].isna().any(axis=1)]
-    if not invalid_rows.empty:
-        st.warning("Certaines lignes ont des valeurs invalides ou manquantes.")
-        
-        # Option de correction manuelle
-        correction_mode = st.checkbox("Activer la correction manuelle des lignes", key="correction_mode")
-        
-        if correction_mode:
-            corrected_data = invalid_rows.copy()
-            
-            for idx, row in invalid_rows.iterrows():
-                st.write(f"\n### Correction pour la ligne {idx}")
-                
-                for col in ['technique', 'physique']:
-                    if pd.isna(row[col]):
-                        current_value = st.text_input(
-                            f"Valeur pour {col} (Ligne {idx})", 
-                            value="", 
-                            key=f"correction_{idx}_{col}"
-                        )
-                        
-                        if current_value:
-                            try:
-                                score = float(current_value)
-                                if 1 <= score <= 5:
-                                    corrected_data.at[idx, col] = score
-                                else:
-                                    st.error(f"Le score doit être entre 1 et 5 pour {col}")
-                            except ValueError:
-                                st.error(f"Valeur invalide pour {col}")
-            
-            # Mettre à jour les données originales
-            data.update(corrected_data)
+    # Supprimer les lignes avec des valeurs non valides
+    players = players.dropna(subset=['technique', 'physique'])
 
-    # Nettoyer les données : retirer les lignes invalides
-    data_cleaned = data.dropna(subset=['technique', 'physique'])
-
-    # Vérifier les plages de valeurs
-    data_cleaned = data_cleaned[
-        (data_cleaned['technique'] >= 1) & (data_cleaned['technique'] <= 5) &
-        (data_cleaned['physique'] >= 1) & (data_cleaned['physique'] <= 5)
+    # Vérifier les limites des scores
+    players = players[
+        (players['technique'] >= 1) & (players['technique'] <= 5) &
+        (players['physique'] >= 1) & (players['physique'] <= 5)
     ]
 
-    if data_cleaned.empty:
-        st.error("Aucune ligne valide après le nettoyage ! Vérifiez les données dans le fichier.")
-        return None
+    return players
 
-    st.success(f"Données validées et nettoyées ! {len(data_cleaned)} lignes prêtes à l'emploi.")
-    st.dataframe(data_cleaned.head())  # Afficher un aperçu des données nettoyées
-    return data_cleaned
-
-# Nouvelles fonctions pour la gestion des équipes
 def generate_teams(players, num_teams):
     """
     Générer des équipes équilibrées
@@ -168,6 +178,68 @@ def generate_teams(players, num_teams):
 
     return teams
 
+def export_teams_to_excel(teams, output_file="equipes_frisbee.xlsx"):
+    """
+    Exporter les équipes dans un fichier Excel
+    
+    :param teams: Dictionnaire des équipes générées
+    :param output_file: Nom du fichier de sortie
+    :return: Chemin du fichier exporté
+    """
+    try:
+        # Créer un writer Excel
+        with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+            # Calculer les statistiques globales
+            global_stats = {
+                'Statistique': [
+                    'Nombre de joueurs', 
+                    'Score total technique', 
+                    'Score total physique', 
+                    'Score total général'
+                ]
+            }
+            
+            # Parcourir chaque équipe
+            for team_id, team in teams.items():
+                # Convertir l'équipe en DataFrame
+                team_df = pd.DataFrame(team)
+                
+                # Nommer explicitement les colonnes
+                team_df.columns = [
+                    'Nom', 
+                    'Score Technique', 
+                    'Score Physique', 
+                    'Score Total'
+                ][:len(team_df.columns)]
+                
+                # Écrire l'équipe dans une feuille
+                team_df.to_excel(
+                    writer, 
+                    index=False, 
+                    sheet_name=f"Équipe {team_id + 1}"
+                )
+                
+                # Calculer les statistiques de l'équipe
+                global_stats[f'Équipe {team_id + 1}'] = [
+                    len(team),
+                    team_df['Score Technique'].sum() if 'Score Technique' in team_df.columns else 0,
+                    team_df['Score Physique'].sum() if 'Score Physique' in team_df.columns else 0,
+                    team_df['Score Total'].sum() if 'Score Total' in team_df.columns else 0
+                ]
+            
+            # Créer une feuille de statistiques globales
+            stats_df = pd.DataFrame(global_stats)
+            stats_df.to_excel(
+                writer, 
+                index=False, 
+                sheet_name="Statistiques Globales"
+            )
+        
+        return output_file
+    
+    except Exception as e:
+        raise ValueError(f"Erreur lors de l'exportation : {e}")
+
 def plot_teams(teams):
     """
     Générer un graphique comparant les scores des équipes
@@ -176,16 +248,30 @@ def plot_teams(teams):
     team_totals = {team_id: sum(player.total for player in team) for team_id, team in teams.items()}
     
     # Créer un graphique en barres
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(team_totals.keys(), team_totals.values(), color='skyblue')
-    ax.set_title("Comparaison des scores totaux des équipes", fontsize=14)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(
+        [f"Équipe {team_id + 1}" for team_id in team_totals.keys()], 
+        team_totals.values(), 
+        color='skyblue', 
+        edgecolor='navy'
+    )
+    ax.set_title("Comparaison des scores totaux des équipes", fontsize=16)
     ax.set_xlabel("Équipe", fontsize=12)
     ax.set_ylabel("Score total (technique + physique)", fontsize=12)
-    ax.set_xticks(list(team_totals.keys()))
-    ax.set_xticklabels([f"Équipe {team_id + 1}" for team_id in team_totals.keys()])
     
+    # Ajouter les valeurs sur les barres
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(
+            bar.get_x() + bar.get_width()/2., 
+            height,
+            f'{height:.1f}',
+            ha='center', 
+            va='bottom'
+        )
+    
+    plt.tight_layout()
     return fig
-
 
 
 # Interface principale

@@ -2,16 +2,63 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import io
+import re
+import math
 
 # Configuration de base de Streamlit
 st.set_page_config(page_title="Gestion des Équipes Frisbee", page_icon=":rugby_football:")
 
-# Définir les alias pour les colonnes
+# Définir les alias pour les colonnes avec plus de flexibilité
 COLUMN_ALIASES = {
-    'nom': ['nom', 'name', 'joueur', 'player', 'prenom', 'firstname'],
-    'technique': ['technique', 'skill', 'competence', 'capacite', 'tech'],
-    'physique': ['physique', 'physical', 'condition', 'fitness', 'phys']
+    'nom': [
+        'nom', 'name', 'joueur', 'player', 'prenom', 'firstname', 
+        'nom et prénom', 'participant', 'prénom', 'identifiant'
+    ],
+    'technique': [
+        'technique', 'skill', 'competence', 'capacite', 'tech', 
+        'niveau technique', 'niveau', 'note technique', 
+        'note ton niveau technique', 'compétence'
+    ],
+    'physique': [
+        'physique', 'physical', 'condition', 'fitness', 'phys', 
+        'niveau physique', 'forme', 'endurance', 
+        'note physique', 'note ton niveau physique'
+    ]
 }
+
+def clean_column_name(column):
+    """
+    Nettoyer et normaliser les noms de colonnes
+    """
+    return (column.lower()
+        .replace(' ', '')
+        .replace('é', 'e')
+        .replace('è', 'e')
+        .replace('ê', 'e')
+    )
+
+def extract_numeric_value(value):
+    """
+    Extraire une valeur numérique d'une chaîne
+    Gère les formats comme "4/5", "4 / 5", etc.
+    """
+    if pd.isna(value):
+        return None
+    
+    # Convertir en chaîne si ce n'est pas déjà le cas
+    str_value = str(value).lower().replace(',', '.')
+    
+    # Chercher un nombre (entier ou decimal)
+    match = re.search(r'(\d+(?:\.\d+)?)', str_value)
+    
+    if match:
+        try:
+            num = float(match.group(1))
+            return num if 1 <= num <= 5 else None
+        except (ValueError, TypeError):
+            return None
+    
+    return None
 
 def fuzzy_column_match(data_columns):
     """
@@ -20,19 +67,25 @@ def fuzzy_column_match(data_columns):
     column_mapping = {}
     unmatched_columns = []
 
+    # Normaliser les noms de colonnes existants
+    normalized_data_columns = [clean_column_name(col) for col in data_columns]
+    
     for req_col, aliases in COLUMN_ALIASES.items():
-        # Normaliser les noms de colonnes existants
-        normalized_data_columns = [col.lower().replace(' ', '') for col in data_columns]
-        
         # Rechercher une correspondance
         matched = False
         for alias in aliases:
-            normalized_alias = alias.lower().replace(' ', '')
-            if normalized_alias in normalized_data_columns:
-                # Trouver l'index de la colonne correspondante
-                orig_col = data_columns[normalized_data_columns.index(normalized_alias)]
-                column_mapping[req_col] = orig_col
-                matched = True
+            normalized_alias = clean_column_name(alias)
+            
+            # Recherche inclusive
+            for idx, norm_col in enumerate(normalized_data_columns):
+                if (normalized_alias in norm_col or 
+                    norm_col in normalized_alias):
+                    orig_col = data_columns[idx]
+                    column_mapping[req_col] = orig_col
+                    matched = True
+                    break
+            
+            if matched:
                 break
         
         if not matched:
@@ -41,12 +94,40 @@ def fuzzy_column_match(data_columns):
     return column_mapping, unmatched_columns
 
 def load_and_preview_data(uploaded_file):
+    """
+    Charger des fichiers avec support élargi
+    """
     try:
-        # Lire le fichier (support Excel et CSV)
+        # Support élargi des fichiers
         if uploaded_file.name.endswith(('.xls', '.xlsx')):
-            data = pd.read_excel(uploaded_file)
+            try:
+                # Premier essai : lecture standard
+                data = pd.read_excel(uploaded_file)
+            except Exception:
+                # Deuxième essai avec openpyxl
+                data = pd.read_excel(
+                    uploaded_file, 
+                    engine='openpyxl', 
+                    dtype=str  # Lire tous les types comme des chaînes
+                )
+        elif uploaded_file.name.endswith('.csv'):
+            # Support des CSV avec différents encodages
+            encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
+            for encoding in encodings:
+                try:
+                    data = pd.read_csv(uploaded_file, encoding=encoding)
+                    break
+                except Exception:
+                    continue
+            else:
+                st.error("Impossible de lire le fichier CSV")
+                return None
         else:
-            data = pd.read_csv(uploaded_file)
+            st.error("Format de fichier non supporté")
+            return None
+
+        # Nettoyer les noms de colonnes
+        data.columns = data.columns.str.strip()
         
         st.info("Fichier chargé avec succès ! Voici un aperçu des premières lignes :")
         st.dataframe(data.head())  # Afficher les 5 premières lignes pour prévisualisation
@@ -56,6 +137,9 @@ def load_and_preview_data(uploaded_file):
         return None
 
 def validate_columns(data):
+    """
+    Identification et validation des colonnes
+    """
     st.write("**Étape 1 : Identification des colonnes**")
     
     # Recherche de correspondance floue
@@ -75,27 +159,58 @@ def validate_columns(data):
             column_mapping[missing_col] = selected_col
     
     # Renommer les colonnes
-    data_renamed = data.rename(columns=column_mapping)
+    data_renamed = data.copy()
     
     # Vérifier que toutes les colonnes requises sont présentes
     final_columns = ['nom', 'technique', 'physique']
-    for col in final_columns:
-        if col not in data_renamed.columns:
-            st.error(f"La colonne '{col}' est manquante.")
-            return False, None, None
+    final_mapping = {}
+    
+    for req_col in final_columns:
+        # Trouver la colonne sélectionnée
+        matched_col = column_mapping.get(req_col)
+        
+        if matched_col:
+            if req_col == 'nom':
+                # Spécifiquement pour la colonne nom, s'assurer qu'elle n'est pas vide
+                data_renamed[req_col] = data_renamed[matched_col].fillna('Joueur')
+            
+            # Convertir les colonnes technique et physique
+            if req_col in ['technique', 'physique']:
+                data_renamed[req_col] = data_renamed[matched_col].apply(extract_numeric_value)
+            
+            final_mapping[req_col] = matched_col
+    
+    # Vérifier la conversion
+    try:
+        # Vérifier la conversion des colonnes
+        conversion_check = data_renamed[final_columns].notna().all()
+        
+        # Afficher un avertissement si des valeurs sont manquantes
+        if not conversion_check['nom']:
+            st.warning("Certains noms n'ont pas pu être extraits correctement.")
+        
+        if not conversion_check['technique'] or not conversion_check['physique']:
+            st.warning("Certaines valeurs de technique ou physique n'ont pas pu être converties.")
+    except KeyError:
+        st.error("Impossible de convertir toutes les colonnes requises.")
+        return False, None, None
     
     st.success("Toutes les colonnes nécessaires sont identifiées !")
-    return True, data_renamed, column_mapping
+    return True, data_renamed, final_mapping
 
 def validate_and_clean_data(data):
+    """
+    Validation et nettoyage des données
+    """
     st.write("**Étape 2 : Validation et nettoyage des données**")
     
-    # Convertir les colonnes en numérique, forcer les erreurs à NaN
+    # Convertir les colonnes en numérique
     for col in ['technique', 'physique']:
         data[col] = pd.to_numeric(data[col], errors='coerce')
 
     # Vérifier les valeurs manquantes ou non valides
     invalid_rows = data[data[['technique', 'physique']].isna().any(axis=1)]
+    
     if not invalid_rows.empty:
         st.warning("Certaines lignes ont des valeurs invalides ou manquantes.")
         
@@ -145,6 +260,136 @@ def validate_and_clean_data(data):
     st.success(f"Données validées et nettoyées ! {len(data_cleaned)} lignes prêtes à l'emploi.")
     st.dataframe(data_cleaned.head())  # Afficher un aperçu des données nettoyées
     return data_cleaned
+def suggest_team_configurations(total_players):
+    """
+    Suggérer des configurations d'équipes optimales
+    """
+    suggestions = []
+    
+    # Configurations possibles
+    possible_team_sizes = [
+        (2, 6, 7),   # 2 équipes
+        (3, 4, 5),   # 3 équipes
+        (4, 3, 4),   # 4 équipes
+        (5, 3, 3),   # 5 équipes
+        (6, 2, 3)    # 6 équipes
+    ]
+    
+    for num_teams, min_per_team, max_per_team in possible_team_sizes:
+        if (total_players >= num_teams * min_per_team and 
+            total_players <= num_teams * max_per_team):
+            suggestions.append({
+                'num_teams': num_teams,
+                'players_per_team': total_players // num_teams,
+                'remainder': total_players % num_teams
+            })
+    
+    return suggestions
+
+def display_team_suggestions(total_players):
+    """
+    Afficher les suggestions de configuration d'équipes
+    """
+    st.subheader("🏁 Suggestions de Configuration d'Équipes")
+    
+    suggestions = suggest_team_configurations(total_players)
+    
+    for suggestion in suggestions:
+        st.markdown(f"""
+        - **{suggestion['num_teams']} équipes**
+          * Joueurs par équipe : {suggestion['players_per_team']} 
+          * Joueurs restants : {suggestion['remainder']}
+        """)
+
+def plan_tournament(teams, match_duration=20, break_duration=10):
+    """
+    Planifier un tournoi avec gestion des matchs et pauses
+    """
+    num_teams = len(teams)
+    
+    # Calcul du nombre de matchs
+    total_matches = math.comb(num_teams, 2)
+    
+    # Estimation du temps total
+    total_match_time = total_matches * match_duration
+    total_break_time = (total_matches - 1) * break_duration
+    total_tournament_time = total_match_time + total_break_time
+    
+    st.subheader("📅 Planification du Tournoi")
+    
+    st.markdown(f"""
+    **Détails du Tournoi :**
+    - Nombre d'équipes : {num_teams}
+    - Nombre total de matchs : {total_matches}
+    - Durée de chaque match : {match_duration} minutes
+    - Pause entre les matchs : {break_duration} minutes
+    
+    **Estimation du Temps Total :** {total_tournament_time} minutes (environ {total_tournament_time/60:.1f} heures)
+    """)
+    
+    # Générer un planning potentiel
+    st.subheader("Planning Proposé")
+    planning = []
+    current_time = 0
+    
+    for match_num in range(total_matches):
+        match_start = current_time
+        match_end = match_start + match_duration
+        
+        planning.append({
+            'Match': f"Match {match_num + 1}",
+            'Début': f"{match_start} min",
+            'Fin': f"{match_end} min"
+        })
+        
+        current_time = match_end + break_duration
+    
+    st.dataframe(planning)
+
+def modify_player_data(data):
+    """
+    Interface de modification des données des joueurs
+    """
+    st.subheader("🔧 Modification des Données des Joueurs")
+    
+    # Créer une copie modifiable des données
+    modified_data = data.copy()
+    
+    # Sélectionner les joueurs à modifier
+    selected_players = st.multiselect(
+        "Sélectionner les joueurs à modifier", 
+        modified_data['nom'].tolist()
+    )
+    
+    if selected_players:
+        for player in selected_players:
+            st.write(f"### Modification de {player}")
+            
+            # Colonnes modifiables
+            cols = st.columns(3)
+            with cols[0]:
+                new_technique = st.number_input(
+                    f"Niveau Technique de {player}", 
+                    min_value=1.0, 
+                    max_value=5.0, 
+                    value=modified_data.loc[modified_data['nom'] == player, 'technique'].values[0],
+                    step=0.5
+                )
+            
+            with cols[1]:
+                new_physique = st.number_input(
+                    f"Niveau Physique de {player}", 
+                    min_value=1.0, 
+                    max_value=5.0, 
+                    value=modified_data.loc[modified_data['nom'] == player, 'physique'].values[0],
+                    step=0.5
+                )
+            
+            # Mettre à jour les données
+            modified_data.loc[modified_data['nom'] == player, 'technique'] = new_technique
+            modified_data.loc[modified_data['nom'] == player, 'physique'] = new_physique
+    
+    return modified_data
 
 def generate_teams(players, num_teams):
     """
@@ -153,9 +398,15 @@ def generate_teams(players, num_teams):
     players['total'] = players['technique'] + players['physique']
     sorted_players = players.sort_values(by='total', ascending=False)
 
-    # Ajouter un joueur "joker" si nécessaire pour équilibrer les équipes
-    if len(sorted_players) % num_teams != 0:
-        joker = pd.DataFrame([{"nom": "Joker", "technique": 0, "physique": 0, "total": 0}])
+    # Ajouter des joueurs "joker" si nécessaire pour équilibrer les équipes
+    while len(sorted_players) % num_teams != 0:
+        joker_index = len(sorted_players)
+        joker = pd.DataFrame([{
+            "nom": f"Joker {joker_index + 1}", 
+            "technique": 0, 
+            "physique": 0, 
+            "total": 0
+        }])
         sorted_players = pd.concat([sorted_players, joker], ignore_index=True)
 
     # Distribution des joueurs dans les équipes (en serpentin)
@@ -300,6 +551,14 @@ def main():
                     with st.expander("Détails du chargement"):
                         st.write("Mapping des colonnes :", column_mapping)
                         st.write(f"Nombre total de joueurs : {len(clean_data)}")
+                    
+                    # Modification des données
+                    st.subheader("🔍 Préparation des Équipes")
+                    if st.checkbox("Modifier les données des joueurs"):
+                        clean_data = modify_player_data(clean_data)
+                    
+                    # Suggestions de configuration d'équipes
+                    display_team_suggestions(len(clean_data))
                     
                     # Nombre d'équipes
                     col1, col2 = st.columns(2)
